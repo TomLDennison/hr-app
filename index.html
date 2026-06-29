@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FR165 Heart Rate → S3</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 1rem; max-width: 640px; }
+    button { font-size: 1.2rem; padding: 0.6rem 1rem; }
+    #bpm { font-size: 3rem; font-weight: 700; margin: 0.5rem 0; }
+    #status { color: #555; }
+    pre { background: #f4f4f4; padding: 0.5rem; font-size: 0.8rem;
+          max-height: 40vh; overflow: auto; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h2>FR165 Heart Rate → S3</h2>
+
+  <!-- ====================================================================
+       SET THIS once your AWS endpoint exists (see README, Phase 3).
+       Until you do, the page still works as a pure BLE viewer — it just
+       skips the upload and logs "(ingest not configured)".
+       ==================================================================== -->
+  <script>
+    const INGEST_URL = "https://YOUR_API_ID.execute-api.us-east-1.amazonaws.com/hr";
+  </script>
+
+  <p>
+    <button id="connect">Connect FR165</button>
+    <label style="margin-left:1rem;">
+      <input type="checkbox" id="wake" checked> keep screen on
+    </label>
+  </p>
+
+  <div id="bpm">— bpm</div>
+  <div id="status">Not connected.</div>
+  <pre id="log"></pre>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const ingestReady = !INGEST_URL.includes("YOUR_API_ID");
+
+    function log(msg) {
+      const t = new Date().toLocaleTimeString();
+      $("log").textContent = `${t}  ${msg}\n` + $("log").textContent.slice(0, 5000);
+    }
+    function setStatus(s) { $("status").textContent = s; }
+
+    let buf = [];                         // client-side batch buffer
+    setInterval(flush, 5000);             // upload every 5 seconds
+
+    // ----- Bluetooth ------------------------------------------------------
+    $("connect").onclick = async () => {
+      if (!navigator.bluetooth) {
+        setStatus("Web Bluetooth not available. Use Chrome on Android, page served over HTTPS.");
+        return;
+      }
+      try {
+        if ($("wake").checked && "wakeLock" in navigator) {
+          try { await navigator.wakeLock.request("screen"); } catch (e) { /* best effort */ }
+        }
+        setStatus("Scanning… pick your watch in the chooser.");
+        const device = await navigator.bluetooth.requestDevice({
+          filters: [{ services: ["heart_rate"] }]
+        });
+        device.addEventListener("gattserverdisconnected", () =>
+          setStatus("Disconnected. Tap Connect to reconnect."));
+        const server  = await device.gatt.connect();
+        const service = await server.getPrimaryService("heart_rate");
+        const ch      = await service.getCharacteristic("heart_rate_measurement");
+        await ch.startNotifications();
+        ch.addEventListener("characteristicvaluechanged", onHR);
+        setStatus(`Connected to ${device.name || "watch"}.` +
+                  (ingestReady ? " Uploading to S3." : " (ingest not configured — viewer only)"));
+        log("connected");
+      } catch (err) {
+        setStatus("Connect failed: " + err);
+        log("connect error: " + err);
+      }
+    };
+
+    // Parse the 0x2A37 Heart Rate Measurement characteristic.
+    function parseHR(dv) {
+      const flags = dv.getUint8(0);
+      return (flags & 0x01) ? dv.getUint16(1, true) : dv.getUint8(1);
+    }
+
+    function onHR(e) {
+      const bpm = parseHR(e.target.value);
+      $("bpm").textContent = bpm + " bpm";
+      const rec = { ts: new Date().toISOString(), bpm, device: "fr165" };
+      buf.push(rec);
+    }
+
+    // ----- Upload ---------------------------------------------------------
+    async function flush() {
+      if (!buf.length) return;
+      const batch = buf; buf = [];
+      if (!ingestReady) { log(`(ingest not configured) buffered ${batch.length} samples`); return; }
+      try {
+        const res = await fetch(INGEST_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(batch)
+        });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        log(`uploaded ${batch.length} samples`);
+      } catch (err) {
+        buf = batch.concat(buf);          // re-queue on failure
+        log("upload failed (re-queued): " + err);
+      }
+    }
+  </script>
+</body>
+</html>
