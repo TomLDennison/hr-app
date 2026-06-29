@@ -39,6 +39,11 @@
   <div id="status">Not connected.</div>
   <pre id="log"></pre>
 
+  <details style="margin-top:1rem;">
+    <summary>Show QR — scan to open this page on a phone</summary>
+    <img src="qr.png" alt="QR code linking to this page" width="220" style="margin-top:0.5rem;">
+  </details>
+
   <script>
     const $ = (id) => document.getElementById(id);
     const ingestReady = !INGEST_URL.includes("YOUR_API_ID");
