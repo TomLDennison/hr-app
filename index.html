@@ -8,7 +8,8 @@
     body { font-family: system-ui, sans-serif; margin: 1rem; max-width: 640px; }
     button { font-size: 1.2rem; padding: 0.6rem 1rem; }
     #bpm { font-size: 3rem; font-weight: 700; margin: 0.5rem 0; }
-    #status { color: #555; }
+    #status, #counter { color: #555; }
+    #counter { font-size: 0.9rem; }
     pre { background: #f4f4f4; padding: 0.5rem; font-size: 0.8rem;
           max-height: 40vh; overflow: auto; white-space: pre-wrap; }
   </style>
@@ -23,6 +24,7 @@
        ==================================================================== -->
   <script>
     const INGEST_URL = "https://YOUR_API_ID.execute-api.us-east-1.amazonaws.com/hr";
+    const FLUSH_MS   = 5000;   // how often samples are uploaded (NOT the display rate)
   </script>
 
   <p>
@@ -33,6 +35,7 @@
   </p>
 
   <div id="bpm">— bpm</div>
+  <div id="counter">0 samples · last: —</div>
   <div id="status">Not connected.</div>
   <pre id="log"></pre>
 
@@ -47,37 +50,77 @@
     function setStatus(s) { $("status").textContent = s; }
 
     let buf = [];                         // client-side batch buffer
-    setInterval(flush, 5000);             // upload every 5 seconds
+    let total = 0;                        // lifetime sample count (proves the ~1 Hz tick)
+    setInterval(flush, FLUSH_MS);
+
+    // ----- Screen Wake Lock ----------------------------------------------
+    // Keeps the screen awake so Chrome doesn't suspend the page (and with it,
+    // Bluetooth + uploads). Android releases the lock when the page is hidden,
+    // so we re-acquire it whenever the page becomes visible again.
+    let wakeLock = null;
+    async function acquireWakeLock() {
+      if (!$("wake").checked || !("wakeLock" in navigator)) return;
+      try { wakeLock = await navigator.wakeLock.request("screen"); }
+      catch (e) { log("wake lock failed: " + e); }
+    }
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") acquireWakeLock();
+    });
 
     // ----- Bluetooth ------------------------------------------------------
-    $("connect").onclick = async () => {
+    let bleDevice = null;
+
+    $("connect").onclick = () => connect();
+
+    async function connect() {
       if (!navigator.bluetooth) {
         setStatus("Web Bluetooth not available. Use Chrome on Android, page served over HTTPS.");
         return;
       }
       try {
-        if ($("wake").checked && "wakeLock" in navigator) {
-          try { await navigator.wakeLock.request("screen"); } catch (e) { /* best effort */ }
-        }
+        await acquireWakeLock();
         setStatus("Scanning… pick your watch in the chooser.");
-        const device = await navigator.bluetooth.requestDevice({
+        bleDevice = await navigator.bluetooth.requestDevice({
           filters: [{ services: ["heart_rate"] }]
         });
-        device.addEventListener("gattserverdisconnected", () =>
-          setStatus("Disconnected. Tap Connect to reconnect."));
-        const server  = await device.gatt.connect();
-        const service = await server.getPrimaryService("heart_rate");
-        const ch      = await service.getCharacteristic("heart_rate_measurement");
-        await ch.startNotifications();
-        ch.addEventListener("characteristicvaluechanged", onHR);
-        setStatus(`Connected to ${device.name || "watch"}.` +
-                  (ingestReady ? " Uploading to S3." : " (ingest not configured — viewer only)"));
-        log("connected");
+        bleDevice.addEventListener("gattserverdisconnected", onDisconnect);
+        await startNotifications(bleDevice);
       } catch (err) {
         setStatus("Connect failed: " + err);
         log("connect error: " + err);
       }
-    };
+    }
+
+    async function startNotifications(device) {
+      const server  = await device.gatt.connect();
+      const service = await server.getPrimaryService("heart_rate");
+      const ch      = await service.getCharacteristic("heart_rate_measurement");
+      await ch.startNotifications();
+      ch.addEventListener("characteristicvaluechanged", onHR);
+      setStatus(`Connected to ${device.name || "watch"}.` +
+                (ingestReady ? " Uploading to S3." : " (ingest not configured — viewer only)"));
+      log("connected");
+    }
+
+    // Auto-reconnect: if the watch drops (range, sleep, brief glitch), keep
+    // retrying instead of giving up. Stops once it reconnects.
+    let reconnecting = false;
+    async function onDisconnect() {
+      setStatus("Disconnected — attempting to reconnect…");
+      log("disconnected");
+      if (reconnecting || !bleDevice) return;
+      reconnecting = true;
+      while (bleDevice && !bleDevice.gatt.connected) {
+        try {
+          await startNotifications(bleDevice);
+          break;
+        } catch (e) {
+          log("reconnect retry in 5s…");
+          await new Promise(r => setTimeout(r, 5000));
+        }
+      }
+      reconnecting = false;
+    }
 
     // Parse the 0x2A37 Heart Rate Measurement characteristic.
     function parseHR(dv) {
@@ -88,8 +131,9 @@
     function onHR(e) {
       const bpm = parseHR(e.target.value);
       $("bpm").textContent = bpm + " bpm";
-      const rec = { ts: new Date().toISOString(), bpm, device: "fr165" };
-      buf.push(rec);
+      total++;
+      $("counter").textContent = `${total} samples · last: ${new Date().toLocaleTimeString()}`;
+      buf.push({ ts: new Date().toISOString(), bpm, device: "fr165" });
     }
 
     // ----- Upload ---------------------------------------------------------
